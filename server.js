@@ -2,6 +2,7 @@ import express from "express";
 import TelegramBot from "node-telegram-bot-api";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
+import fs from "node:fs";
 
 const PORT=Number(process.env.PORT||8080);
 const TG=process.env.TELEGRAM_BOT_TOKEN;
@@ -14,6 +15,8 @@ const TIMEOUT=Number(process.env.CLAUDE_TIMEOUT_MS||1800000);
 const ALLOWED=new Set((process.env.TELEGRAM_ALLOWED_CHAT_IDS||"").split(',').map(x=>x.trim()).filter(Boolean));
 if(!TG) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 if(!APIKEY) throw new Error("Missing TABITOKEN_API_KEY");
+
+fs.mkdirSync(WORKDIR,{recursive:true});
 
 const app=express(); app.use(express.json({limit:"20mb"}));
 app.get('/',(_,r)=>r.json({ok:true,service:"claude-code-telegram",model:MODEL,provider:"tabitoken"}));
@@ -53,7 +56,16 @@ app.post('/v1/messages',async(req,res)=>{
 const active=new Map();
 const allowed=m=>!ALLOWED.size||ALLOWED.has(String(m.chat.id))||ALLOWED.has(String(m.from?.id));
 const clip=(s,n=3900)=>String(s||'').length<=n?String(s||''):String(s||'').slice(0,n)+'\n…[truncated]';
-function runClaude(prompt,chat){return new Promise((resolve,reject)=>{const env={...process.env,ANTHROPIC_BASE_URL:`http://127.0.0.1:${PORT}`,ANTHROPIC_AUTH_TOKEN:AUTH,ANTHROPIC_MODEL:MODEL};const p=spawn('claude',['-p',prompt,'--output-format','text','--dangerously-skip-permissions'],{cwd:WORKDIR,env,stdio:['ignore','pipe','pipe']});let out='',err='';const started=Date.now();active.set(chat,{child:p,started,stderr:''});const to=setTimeout(()=>p.kill('SIGTERM'),TIMEOUT);p.stdout.on('data',b=>out+=b);p.stderr.on('data',b=>{err+=b;const a=active.get(chat);if(a)a.stderr=err.trim().split(/\r?\n/).at(-1)||''});p.on('error',e=>{clearTimeout(to);active.delete(chat);reject(e)});p.on('close',(code,signal)=>{clearTimeout(to);active.delete(chat);if(code===0)resolve(out.trim());else reject(new Error(`Claude Code exited code=${code} signal=${signal}\n${err.slice(-3000)}`))})})}
+function runClaude(prompt,chat){return new Promise((resolve,reject)=>{
+  const env={...process.env,HOME:process.env.HOME||'/home/agent',ANTHROPIC_BASE_URL:`http://127.0.0.1:${PORT}`,ANTHROPIC_AUTH_TOKEN:AUTH,ANTHROPIC_MODEL:MODEL};
+  console.log(`[claude] starting chat=${chat} uid=${process.getuid?.()??'unknown'} cwd=${WORKDIR} model=${MODEL}`);
+  const p=spawn('claude',['-p',prompt,'--output-format','text','--dangerously-skip-permissions'],{cwd:WORKDIR,env,stdio:['ignore','pipe','pipe']});
+  let out='',err='';const started=Date.now();active.set(chat,{child:p,started,stderr:''});const to=setTimeout(()=>{console.error(`[claude] timeout chat=${chat}`);p.kill('SIGTERM')},TIMEOUT);
+  p.stdout.on('data',b=>{out+=b.toString();});
+  p.stderr.on('data',b=>{const s=b.toString();err+=s;console.error(`[claude] ${s.trimEnd()}`);const a=active.get(chat);if(a)a.stderr=err.trim().split(/\r?\n/).at(-1)||''});
+  p.on('error',e=>{clearTimeout(to);active.delete(chat);console.error(`[claude] spawn error: ${e.stack||e}`);reject(new Error(`Claude Code could not start: ${e.message}`))});
+  p.on('close',(code,signal)=>{clearTimeout(to);active.delete(chat);console.log(`[claude] exited code=${code} signal=${signal} stdout=${out.length} stderr=${err.length}`);if(code===0)resolve(out.trim());else reject(new Error(`Claude Code exited code=${code} signal=${signal}\n${err.slice(-3000)||'No stderr output. Check TabiToken/model configuration and Claude Code startup.'}`))})
+})}
 
 const bot=new TelegramBot(TG,{polling:true});bot.on('polling_error',e=>console.error('Telegram:',e.message));
 bot.onText(/^\/start$/,m=>{if(allowed(m))bot.sendMessage(m.chat.id,'🧠 Claude Code online. Send a task.\n/status — status\n/cancel — stop task')});
