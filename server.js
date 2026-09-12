@@ -15,7 +15,6 @@ const TIMEOUT=Number(process.env.CLAUDE_TIMEOUT_MS||1800000);
 const ALLOWED=new Set((process.env.TELEGRAM_ALLOWED_CHAT_IDS||"").split(',').map(x=>x.trim()).filter(Boolean));
 if(!TG) throw new Error("Missing TELEGRAM_BOT_TOKEN");
 if(!APIKEY) throw new Error("Missing TABITOKEN_API_KEY");
-
 fs.mkdirSync(WORKDIR,{recursive:true});
 
 const app=express(); app.use(express.json({limit:"20mb"}));
@@ -25,7 +24,7 @@ const authOK=req=>req.headers.authorization===`Bearer ${AUTH}`||req.headers['x-a
 const text=c=>typeof c==='string'?c:Array.isArray(c)?c.filter(b=>b?.type==='text').map(b=>b.text||'').join(''):'';
 function toOpenAI(b){
   const m=[];
-  if(b.system)m.push({role:'system',content:Array.isArray(b.system)?b.system.map(x=>x.text||'').join('\n'):String(b.system)});
+  if(b.system)m.push({role:'system',content:Array.isArray(b.system)?b.system.map(x=>x?.text||'').join('\n'):String(b.system)});
   for(const x of b.messages||[]){
     if(x.role==='user'&&Array.isArray(x.content)){
       for(const z of x.content) if(z?.type==='tool_result') m.push({role:'tool',tool_call_id:z.tool_use_id,content:text(z.content)});
@@ -49,22 +48,25 @@ function stream(r,m){sse(r,{type:'message_start',message:{...m,content:[],stop_r
 app.post('/v1/messages',async(req,res)=>{
   if(!authOK(req))return res.status(401).json({type:'error',error:{type:'authentication_error',message:'Unauthorized'}});
   try{const b=req.body||{}, q={model:b.model||MODEL,messages:toOpenAI(b),max_tokens:Number(b.max_tokens||8192),stream:false};const ts=tools(b.tools);if(ts?.length)q.tools=ts;if(b.tool_choice?.type==='auto')q.tool_choice='auto';if(b.tool_choice?.type==='any')q.tool_choice='required';if(b.tool_choice?.type==='tool')q.tool_choice={type:'function',function:{name:b.tool_choice.name}};
-    const u=await fetch(`${BASE}/chat/completions`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${APIKEY}`},body:JSON.stringify(q)}),raw=await u.text();let d;try{d=JSON.parse(raw)}catch{d={raw}};if(!u.ok)return res.status(u.status).json({type:'error',error:{type:'api_error',message:`TabiToken ${u.status}: ${raw.slice(0,4000)}`}});const m=anthropic(d,b.model||MODEL);if(b.stream){res.setHeader('content-type','text/event-stream');res.setHeader('cache-control','no-cache');return stream(res,m)}res.json(m);
-  }catch(e){res.status(500).json({type:'error',error:{type:'api_error',message:String(e?.message||e)}})}
+    console.log(`[bridge] model=${q.model} messages=${q.messages.length} tools=${q.tools?.length||0}`);
+    const u=await fetch(`${BASE}/chat/completions`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${APIKEY}`},body:JSON.stringify(q)}),raw=await u.text();let d;try{d=JSON.parse(raw)}catch{d={raw}};if(!u.ok){console.error(`[bridge] TabiToken ${u.status}: ${raw.slice(0,4000)}`);return res.status(u.status).json({type:'error',error:{type:'api_error',message:`TabiToken ${u.status}: ${raw.slice(0,4000)}`}})}const m=anthropic(d,b.model||MODEL);if(b.stream){res.setHeader('content-type','text/event-stream');res.setHeader('cache-control','no-cache');return stream(res,m)}res.json(m);
+  }catch(e){console.error(`[bridge] error: ${e.stack||e}`);res.status(500).json({type:'error',error:{type:'api_error',message:String(e?.message||e)}})}
 });
 
 const active=new Map();
 const allowed=m=>!ALLOWED.size||ALLOWED.has(String(m.chat.id))||ALLOWED.has(String(m.from?.id));
 const clip=(s,n=3900)=>String(s||'').length<=n?String(s||''):String(s||'').slice(0,n)+'\n…[truncated]';
 function runClaude(prompt,chat){return new Promise((resolve,reject)=>{
-  const env={...process.env,HOME:process.env.HOME||'/home/agent',ANTHROPIC_BASE_URL:`http://127.0.0.1:${PORT}`,ANTHROPIC_AUTH_TOKEN:AUTH,ANTHROPIC_MODEL:MODEL};
+  const env={...process.env,HOME:process.env.HOME||'/home/agent',CI:'1',NO_COLOR:'1',CLAUDE_CODE_DISABLE_AUTO_UPDATE:'1',ANTHROPIC_BASE_URL:`http://127.0.0.1:${PORT}`,ANTHROPIC_AUTH_TOKEN:AUTH,ANTHROPIC_API_KEY:AUTH,ANTHROPIC_MODEL:MODEL};
   console.log(`[claude] starting chat=${chat} uid=${process.getuid?.()??'unknown'} cwd=${WORKDIR} model=${MODEL}`);
-  const p=spawn('claude',['-p',prompt,'--output-format','text','--dangerously-skip-permissions'],{cwd:WORKDIR,env,stdio:['ignore','pipe','pipe']});
+  const args=['-p',prompt,'--output-format','text','--permission-mode','bypassPermissions','--no-session-persistence','--verbose'];
+  console.log(`[claude] command=claude ${args.map((x,i)=>i===1?'[prompt]':x).join(' ')}`);
+  const p=spawn('claude',args,{cwd:WORKDIR,env,stdio:['ignore','pipe','pipe']});
   let out='',err='';const started=Date.now();active.set(chat,{child:p,started,stderr:''});const to=setTimeout(()=>{console.error(`[claude] timeout chat=${chat}`);p.kill('SIGTERM')},TIMEOUT);
   p.stdout.on('data',b=>{out+=b.toString();});
   p.stderr.on('data',b=>{const s=b.toString();err+=s;console.error(`[claude] ${s.trimEnd()}`);const a=active.get(chat);if(a)a.stderr=err.trim().split(/\r?\n/).at(-1)||''});
   p.on('error',e=>{clearTimeout(to);active.delete(chat);console.error(`[claude] spawn error: ${e.stack||e}`);reject(new Error(`Claude Code could not start: ${e.message}`))});
-  p.on('close',(code,signal)=>{clearTimeout(to);active.delete(chat);console.log(`[claude] exited code=${code} signal=${signal} stdout=${out.length} stderr=${err.length}`);if(code===0)resolve(out.trim());else reject(new Error(`Claude Code exited code=${code} signal=${signal}\n${err.slice(-3000)||'No stderr output. Check TabiToken/model configuration and Claude Code startup.'}`))})
+  p.on('close',(code,signal)=>{clearTimeout(to);active.delete(chat);console.log(`[claude] exited code=${code} signal=${signal} stdout=${out.length} stderr=${err.length} elapsed=${Date.now()-started}ms`);if(code===0)resolve(out.trim());else reject(new Error(`Claude Code exited code=${code} signal=${signal}\n${err.slice(-3000)||'No stderr output. Check TabiToken/model configuration and Claude Code startup.'}`))})
 })}
 
 const bot=new TelegramBot(TG,{polling:true});bot.on('polling_error',e=>console.error('Telegram:',e.message));
