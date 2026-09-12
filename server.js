@@ -8,7 +8,8 @@ const PORT=Number(process.env.PORT||8080);
 const TG=process.env.TELEGRAM_BOT_TOKEN;
 const APIKEY=process.env.XKIRO_API_KEY;
 const BASE=(process.env.XKIRO_BASE_URL||"https://api.xkiro.com/v1").replace(/\/+$/,'');
-const MODEL=process.env.CLAUDE_MODEL||"minimax/minimax-m3:free";
+const MODEL=process.env.CLAUDE_MODEL||"claude-sonnet-5";
+const PROVIDER_MODEL=process.env.PROVIDER_MODEL||"minimax/minimax-m3:free";
 const AUTH=process.env.LOCAL_ANTHROPIC_AUTH_TOKEN||crypto.randomBytes(24).toString("hex");
 const WORKDIR=process.env.CLAUDE_WORKDIR||"/app/workspace";
 const TIMEOUT=Number(process.env.CLAUDE_TIMEOUT_MS||1800000);
@@ -18,8 +19,8 @@ if(!APIKEY) throw new Error("Missing XKIRO_API_KEY");
 fs.mkdirSync(WORKDIR,{recursive:true});
 
 const app=express(); app.use(express.json({limit:"20mb"}));
-app.get('/',(_,r)=>r.json({ok:true,service:"claude-code-telegram",model:MODEL,provider:"xkiro"}));
-app.get('/health',(_,r)=>r.json({ok:true,model:MODEL,provider:"xkiro"}));
+app.get('/',(_,r)=>r.json({ok:true,service:"claude-code-telegram",model:PROVIDER_MODEL,claudeModel:MODEL,provider:"xkiro"}));
+app.get('/health',(_,r)=>r.json({ok:true,model:PROVIDER_MODEL,claudeModel:MODEL,provider:"xkiro"}));
 const authOK=req=>req.headers.authorization===`Bearer ${AUTH}`||req.headers['x-api-key']===AUTH;
 const text=c=>typeof c==='string'?c:Array.isArray(c)?c.filter(b=>b?.type==='text').map(b=>b.text||'').join(''):'';
 function toOpenAI(b){
@@ -48,16 +49,16 @@ function stream(r,m){sse(r,{type:'message_start',message:{...m,content:[],stop_r
 app.post('/v1/messages',async(req,res)=>{
   if(!authOK(req))return res.status(401).json({type:'error',error:{type:'authentication_error',message:'Unauthorized'}});
   try{
-    const b=req.body||{}, q={model:MODEL,messages:toOpenAI(b),max_tokens:Number(b.max_tokens||8192),stream:false};
+    const b=req.body||{}, q={model:PROVIDER_MODEL,messages:toOpenAI(b),max_tokens:Number(b.max_tokens||8192),stream:false};
     const ts=tools(b.tools); if(ts?.length)q.tools=ts;
     if(b.tool_choice?.type==='auto')q.tool_choice='auto';
     if(b.tool_choice?.type==='any')q.tool_choice='required';
     if(b.tool_choice?.type==='tool')q.tool_choice={type:'function',function:{name:b.tool_choice.name}};
-    console.log(`[bridge] model=${q.model} messages=${q.messages.length} tools=${q.tools?.length||0}`);
+    console.log(`[bridge] claudeModel=${b.model||MODEL} providerModel=${q.model} messages=${q.messages.length} tools=${q.tools?.length||0}`);
     const u=await fetch(`${BASE}/chat/completions`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${APIKEY}`},body:JSON.stringify(q)}),raw=await u.text();
     let d; try{d=JSON.parse(raw)}catch{d={raw}};
     if(!u.ok){console.error(`[bridge] xKiro ${u.status}: ${raw.slice(0,4000)}`);return res.status(u.status).json({type:'error',error:{type:'api_error',message:`xKiro ${u.status}: ${raw.slice(0,4000)}`}})}
-    const m=anthropic(d,MODEL); if(b.stream){res.setHeader('content-type','text/event-stream');res.setHeader('cache-control','no-cache');return stream(res,m)} res.json(m);
+    const m=anthropic(d,b.model||MODEL); if(b.stream){res.setHeader('content-type','text/event-stream');res.setHeader('cache-control','no-cache');return stream(res,m)} res.json(m);
   }catch(e){console.error(`[bridge] error: ${e.stack||e}`);res.status(500).json({type:'error',error:{type:'api_error',message:String(e?.message||e)}})}
 });
 
@@ -66,7 +67,7 @@ const allowed=m=>!ALLOWED.size||ALLOWED.has(String(m.chat.id))||ALLOWED.has(Stri
 const clip=(s,n=3900)=>String(s||'').length<=n?String(s||''):String(s||'').slice(0,n)+'\n…[truncated]';
 function runClaude(prompt,chat){return new Promise((resolve,reject)=>{
   const env={...process.env,HOME:process.env.HOME||'/home/agent',CI:'1',NO_COLOR:'1',CLAUDE_CODE_DISABLE_AUTO_UPDATE:'1',ANTHROPIC_BASE_URL:`http://127.0.0.1:${PORT}`,ANTHROPIC_AUTH_TOKEN:AUTH,ANTHROPIC_API_KEY:AUTH,ANTHROPIC_MODEL:MODEL};
-  console.log(`[claude] starting chat=${chat} uid=${process.getuid?.()??'unknown'} cwd=${WORKDIR} model=${MODEL}`);
+  console.log(`[claude] starting chat=${chat} uid=${process.getuid?.()??'unknown'} cwd=${WORKDIR} model=${MODEL} providerModel=${PROVIDER_MODEL}`);
   const args=['-p',prompt,'--output-format','text','--permission-mode','bypassPermissions','--no-session-persistence','--verbose'];
   console.log(`[claude] command=claude ${args.map((x,i)=>i===1?'[prompt]':x).join(' ')}`);
   const p=spawn('claude',args,{cwd:WORKDIR,env,stdio:['ignore','pipe','pipe']});
@@ -82,4 +83,4 @@ bot.onText(/^\/start$/,m=>{if(allowed(m))bot.sendMessage(m.chat.id,'🧠 Claude 
 bot.onText(/^\/status$/,m=>{if(!allowed(m))return;const a=active.get(String(m.chat.id));bot.sendMessage(m.chat.id,a?`🛠️ Working ${Math.floor((Date.now()-a.started)/1000)}s\n${a.stderr||''}`:'✅ No active task.')});
 bot.onText(/^\/cancel$/,m=>{if(!allowed(m))return;const a=active.get(String(m.chat.id));if(!a)return bot.sendMessage(m.chat.id,'ℹ️ No active task.');a.child.kill('SIGTERM');bot.sendMessage(m.chat.id,'🛑 Cancellation requested.')});
 bot.on('message',async m=>{if(!m.text||m.text.startsWith('/')||!allowed(m))return;const chat=String(m.chat.id);if(active.has(chat))return bot.sendMessage(m.chat.id,'⏳ A task is already running. Use /cancel first.');const st=await bot.sendMessage(m.chat.id,'🧠 Claude Code starting…');const hb=setInterval(()=>{const a=active.get(chat);if(a)bot.editMessageText(`🧠 Claude Code working… ${Math.floor((Date.now()-a.started)/1000)}s\n${a.stderr||'Running tools / editing files…'}`,{chat_id:m.chat.id,message_id:st.message_id}).catch(()=>{})},5000);try{const out=await runClaude(m.text,chat);clearInterval(hb);await bot.editMessageText('✅ Done.',{chat_id:m.chat.id,message_id:st.message_id});await bot.sendMessage(m.chat.id,clip(out||'(No text output.)'))}catch(e){clearInterval(hb);await bot.editMessageText('❌ Claude Code failed.',{chat_id:m.chat.id,message_id:st.message_id});await bot.sendMessage(m.chat.id,clip(e?.message||e))}});
-app.listen(PORT,'0.0.0.0',()=>console.log(`Listening ${PORT}; model=${MODEL}; xKiro=${BASE}`));
+app.listen(PORT,'0.0.0.0',()=>console.log(`Listening ${PORT}; Claude model=${MODEL}; provider model=${PROVIDER_MODEL}; xKiro=${BASE}`));
